@@ -5,7 +5,7 @@
 
     <groupId>com.telefonica.iot</groupId>
     <artifactId>cygnus-common</artifactId>
-    <version>1.8.0_SNAPSHOT</version>
+    <version>1.10.0_SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <name>cygnus-common</name>
@@ -39,7 +39,7 @@
         <dependency>
             <groupId>org.apache.httpcomponents</groupId>
             <artifactId>httpclient</artifactId>
-            <version>4.3.1</version>
+            <version>4.3.6</version>
         </dependency>
         <dependency>
             <groupId>org.apache.httpcomponents</groupId>
@@ -47,9 +47,11 @@
             <version>4.3.1</version>
         </dependency>
         <dependency>
+            <!-- Upgrade from 0.9.1 to 0.12.0 due to github vulnerabilities report.
+                 Note this is a "blind update", we have not tested it -->
             <groupId>org.apache.thrift</groupId>
             <artifactId>libthrift</artifactId>
-            <version>0.9.1</version>
+            <version>0.12.0</version>
         </dependency>
         <!-- Required by the ManagementInterface -->
         <dependency>
@@ -67,7 +69,7 @@
         <dependency>
             <groupId>mysql</groupId>
             <artifactId>mysql-connector-java</artifactId>
-            <version>5.1.31</version>
+            <version>5.1.47</version>
         </dependency>
         <!-- Required by PostgreSQLBackendImpl at runtime -->
         <dependency>
@@ -92,18 +94,18 @@
         <dependency>
             <groupId>org.apache.hive</groupId>
             <artifactId>hive-exec</artifactId>
-            <version>0.13.1</version>
+            <version>2.3.4</version>
         </dependency>
         <dependency>
             <groupId>org.apache.hive</groupId>
             <artifactId>hive-jdbc</artifactId>
-            <version>0.13.1</version>
+            <version>2.3.4</version>
         </dependency>
         <!-- Required by MongoBackendImpl -->
         <dependency>
             <groupId>org.mongodb</groupId>
             <artifactId>mongodb-driver</artifactId>
-            <version>3.0.0</version>
+            <version>3.0.4</version>
         </dependency>
         <!-- Required by KafkaBackendImpl -->
         <dependency>

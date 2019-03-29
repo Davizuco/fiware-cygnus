@@ -18,6 +18,16 @@
 
 package com.telefonica.iot.cygnus.sinks;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.flume.Context;
+import org.apache.flume.EventDeliveryException;
+
 import com.telefonica.iot.cygnus.backends.mysql.MySQLBackendImpl;
 import com.telefonica.iot.cygnus.containers.NotifyContextRequest.ContextAttribute;
 import com.telefonica.iot.cygnus.containers.NotifyContextRequest.ContextElement;
@@ -34,11 +44,6 @@ import com.telefonica.iot.cygnus.utils.CommonUtils;
 import com.telefonica.iot.cygnus.utils.NGSICharsets;
 import com.telefonica.iot.cygnus.utils.NGSIConstants;
 import com.telefonica.iot.cygnus.utils.NGSIUtils;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import org.apache.flume.Context;
 
 /**
  *
@@ -49,21 +54,63 @@ import org.apache.flume.Context;
  */
 public class NGSIMySQLSink extends NGSISink {
     
+    private static final int UNSET_MAX_POOL_SIZE = 0;
+    private static final String DEFAULT_ROW_ATTR_PERSISTENCE = "row";
+    private static final String DEFAULT_PASSWORD = "";
+    private static final String DEFAULT_PORT = "3306";
+    private static final String DEFAULT_HOST = "localhost";
+    private static final String DEFAULT_USER_NAME = "root";
+    private static final int DEFAULT_MAX_POOL_SIZE = 1;
+    
     private static final CygnusLogger LOGGER = new CygnusLogger(NGSIMySQLSink.class);
     private String mysqlHost;
     private String mysqlPort;
     private String mysqlUsername;
     private String mysqlPassword;
+    private int maxPoolSize;
     private boolean rowAttrPersistence;
     private MySQLBackendImpl persistenceBackend;
+    
+    // Concurrent load balancing properties
+    private NGSIMySQLSink parentLoadBalanceSink = null;
+    private Status lastStatus;
+    private AtomicBoolean processInBackground;  // Background process Indicator.
+    
+    private Thread backgroundThread = null;
+    private Semaphore processingSemaphore;  // Semaphore processing control.
     
     /**
      * Constructor.
      */
     public NGSIMySQLSink() {
         super();
+        parentLoadBalanceSink = null;
+        lastStatus = Status.READY;
+        maxPoolSize = UNSET_MAX_POOL_SIZE;
+        
+     // processInBackground = true -> Background process launched
+        processInBackground = new AtomicBoolean(false);
+        processingSemaphore = new Semaphore(1, true);
     } // NGSIMySQLSink
     
+    
+    
+    /**
+     * @param maxPoolSize the maxPoolSize to set, Integer greater than cero.
+     */
+    public void setDefaultMaxPoolSize(int maxPoolSize) {
+        if (maxPoolSize >= 1) {
+            if (this.maxPoolSize == UNSET_MAX_POOL_SIZE) {
+                this.maxPoolSize = maxPoolSize;
+            } else {
+                LOGGER.info("MaxPoolSize value already setted to " + this.maxPoolSize
+                             + ", Can't change default value to " + maxPoolSize);
+            }
+        } else {
+            LOGGER.error("MaxPoolSize must be greater than cero in sink " + this.getName());
+        }
+    }
+
     /**
      * Gets the MySQL host. It is protected due to it is only required for testing purposes.
      * @return The MySQL host
@@ -123,9 +170,9 @@ public class NGSIMySQLSink extends NGSISink {
     
     @Override
     public void configure(Context context) {
-        mysqlHost = context.getString("mysql_host", "localhost");
+        mysqlHost = context.getString("mysql_host", DEFAULT_HOST);
         LOGGER.debug("[" + this.getName() + "] Reading configuration (mysql_host=" + mysqlHost + ")");
-        mysqlPort = context.getString("mysql_port", "3306");
+        mysqlPort = context.getString("mysql_port", DEFAULT_PORT);
         int intPort = Integer.parseInt(mysqlPort);
         
         if ((intPort <= 0) || (intPort > 65535)) {
@@ -136,13 +183,17 @@ public class NGSIMySQLSink extends NGSISink {
             LOGGER.debug("[" + this.getName() + "] Reading configuration (mysql_port=" + mysqlPort + ")");
         }  // if else
         
-        mysqlUsername = context.getString("mysql_username", "root");
+        mysqlUsername = context.getString("mysql_username", DEFAULT_USER_NAME);
         LOGGER.debug("[" + this.getName() + "] Reading configuration (mysql_username=" + mysqlUsername + ")");
-        // FIXME: mysqlPassword should be read as a SHA1 and decoded here
-        mysqlPassword = context.getString("mysql_password", "");
+        // FIXME: mysqlPassword should be read encrypted and decoded here
+        mysqlPassword = context.getString("mysql_password", DEFAULT_PASSWORD);
         LOGGER.debug("[" + this.getName() + "] Reading configuration (mysql_password=" + mysqlPassword + ")");
-        rowAttrPersistence = context.getString("attr_persistence", "row").equals("row");
-        String persistence = context.getString("attr_persistence", "row");
+        
+        maxPoolSize = context.getInteger("mysql_maxPoolSize", UNSET_MAX_POOL_SIZE);
+        LOGGER.debug("[" + this.getName() + "] Reading configuration (mysql_maxPoolSize=" + maxPoolSize + ")");
+        
+        rowAttrPersistence = context.getString("attr_persistence", DEFAULT_ROW_ATTR_PERSISTENCE).equals("row");
+        String persistence = context.getString("attr_persistence", DEFAULT_ROW_ATTR_PERSISTENCE);
         
         if (persistence.equals("row") || persistence.equals("column")) {
             LOGGER.debug("[" + this.getName() + "] Reading configuration (attr_persistence="
@@ -158,19 +209,75 @@ public class NGSIMySQLSink extends NGSISink {
 
     @Override
     public void start() {
+        LOGGER.debug("Starting Sink " + this.getName());
         try {
-            persistenceBackend = new MySQLBackendImpl(mysqlHost, mysqlPort, mysqlUsername, mysqlPassword);
-            LOGGER.debug("[" + this.getName() + "] MySQL persistence backend created");
+            if (persistenceBackend == null) {
+                if (this.parentLoadBalanceSink == null) {
+                    // If Pool size is unset, neither by loadbalancer or config file.
+                    if (maxPoolSize == UNSET_MAX_POOL_SIZE) {
+                        maxPoolSize = DEFAULT_MAX_POOL_SIZE;
+                    }
+                    persistenceBackend = new MySQLBackendImpl(mysqlHost, mysqlPort, mysqlUsername,
+                                                                mysqlPassword, maxPoolSize);
+                    LOGGER.debug("[" + this.getName() + "] MySQL persistence backend created (" + maxPoolSize + ")");
+                } else {
+                    persistenceBackend = new MySQLBackendImpl(parentLoadBalanceSink.getPersistenceBackend());
+                    LOGGER.debug("[" + this.getName() + "] MySQL persistence backend created and linked to "
+                                + parentLoadBalanceSink.getName());
+                }
+            } else {
+                LOGGER.info("Sink " + getName() + " already started.");
+            }
         } catch (Exception e) {
-            LOGGER.error("Error while creating the MySQL persistence backend. Details="
+            LOGGER.error("Error while creating the MySQL persistence backend for sink " + this.getName() + ". Details="
                     + e.getMessage());
         } // try catch
         
         super.start();
     } // start
+
+    @Override
+    public  void stop() {
+        if (processInBackground.get()) {
+            processInBackground.set(false);
+            
+            LOGGER.debug("Closing Background process for sink " + this.getName());
+
+            try {
+                processingSemaphore.acquire();
+                synchronized (this) {
+                    notify();
+                    // Just wait for background thread to finish
+                    LOGGER.trace("Stop Waiting for semaphore..... " + Thread.currentThread().getId());
+                }
+                
+                // Wait Background process to end.
+                // this.backgroundSemaphore.acquire();
+                // this.backgroundSemaphore.release(0);
+                if (backgroundThread != null) {
+                    backgroundThread.join(10000);
+                }
+                if (backgroundThread != null) {
+                    System.out.println("Timeout waiting for background process to end. Sink " + getName());
+                }
+                
+                processingSemaphore.release(0);
+                
+            } catch (Exception e) {
+                LOGGER.error("Error releasing Background Process for sink " + this.getName());
+            }
+        } else {
+            LOGGER.debug("Closing sink " + this.getName());
+        }
+        super.stop();
+        if (persistenceBackend != null) {
+            persistenceBackend.close();
+        }
+        LOGGER.trace("Sink " + getName() + " closed.");
+    } // stop
     
     @Override
-    void persistBatch(NGSIBatch batch)
+    public synchronized void persistBatch(NGSIBatch batch)
         throws CygnusBadConfiguration, CygnusPersistenceError, CygnusRuntimeError, CygnusBadContextData {
         if (batch == null) {
             LOGGER.debug("[" + this.getName() + "] Null batch, nothing to do");
@@ -203,7 +310,7 @@ public class NGSIMySQLSink extends NGSISink {
     } // persistBatch
     
     @Override
-    public void capRecords(NGSIBatch batch, long maxRecords) throws CygnusCappingError {
+    public synchronized void capRecords(NGSIBatch batch, long maxRecords) throws CygnusCappingError {
         if (batch == null) {
             LOGGER.debug("[" + this.getName() + "] Null batch, nothing to do");
             return;
@@ -242,7 +349,7 @@ public class NGSIMySQLSink extends NGSISink {
     } // capRecords
 
     @Override
-    public void expirateRecords(long expirationTime) throws CygnusExpiratingError {
+    public synchronized void expirateRecords(long expirationTime) throws CygnusExpiratingError {
         LOGGER.debug("[" + this.getName() + "] Expirating records (time=" + expirationTime + ")");
         
         try {
@@ -260,20 +367,76 @@ public class NGSIMySQLSink extends NGSISink {
     private abstract class MySQLAggregator {
         
         // object containing the aggregted data
-        protected LinkedHashMap<String, ArrayList<String>> aggregation;
+        private LinkedHashMap<String, ArrayList<String>> aggregation;
 
-        protected String service;
-        protected String servicePathForData;
-        protected String servicePathForNaming;
-        protected String entityForNaming;
-        protected String attribute;
-        protected String dbName;
-        protected String tableName;
+        private String service;
+        private String servicePathForData;
+        private String servicePathForNaming;
+        private String entityForNaming;
+        private String attribute;
+        private String dbName;
+        private String tableName;
         
-        public MySQLAggregator() {
+        MySQLAggregator() {
             aggregation = new LinkedHashMap<>();
         } // MySQLAggregator
         
+        protected LinkedHashMap<String, ArrayList<String>> getAggregation() {
+            return aggregation;
+        } //getAggregation
+
+        @SuppressWarnings("unused")
+        protected void setAggregation(LinkedHashMap<String, ArrayList<String>> aggregation) {
+            this.aggregation = aggregation;
+        } //setAggregation
+
+
+        @SuppressWarnings("unused")
+        protected String getService() {
+            return service;
+        } //getService
+
+
+        @SuppressWarnings("unused")
+        protected void setService(String service) {
+            this.service = service;
+        } //setService
+
+        protected String getServicePathForData() {
+            return servicePathForData;
+        } //getServicePathForData
+
+
+        @SuppressWarnings("unused")
+        protected void setServicePathForData(String servicePathForData) {
+            this.servicePathForData = servicePathForData;
+        } //setServicePathForData
+
+
+        @SuppressWarnings("unused")
+        protected String getServicePathForNaming() {
+            return servicePathForNaming;
+        } //getServicePathForNaming
+
+
+        @SuppressWarnings("unused")
+        protected void setServicePathForNaming(String servicePathForNaming) {
+            this.servicePathForNaming = servicePathForNaming;
+        } //setServicePathForNaming
+
+
+        @SuppressWarnings("unused")
+        protected String getTableName() {
+            return tableName;
+        } //getTableName
+
+        @SuppressWarnings("unused")
+        protected void setTableName(String tableName) {
+            this.tableName = tableName;
+        } //setTableName
+
+
+
         public String getDbName(boolean enableLowercase) {
             if (enableLowercase) {
                 return dbName.toLowerCase();
@@ -302,7 +465,7 @@ public class NGSIMySQLSink extends NGSISink {
                 } // if else
                 
                 boolean first = true;
-                Iterator it = aggregation.keySet().iterator();
+                Iterator<String> it = aggregation.keySet().iterator();
             
                 while (it.hasNext()) {
                     ArrayList<String> values = (ArrayList<String>) aggregation.get((String) it.next());
@@ -323,7 +486,7 @@ public class NGSIMySQLSink extends NGSISink {
         public String getFieldsForCreate() {
             String fieldsForCreate = "(";
             boolean first = true;
-            Iterator it = aggregation.keySet().iterator();
+            Iterator<String> it = aggregation.keySet().iterator();
             
             while (it.hasNext()) {
                 if (first) {
@@ -340,7 +503,7 @@ public class NGSIMySQLSink extends NGSISink {
         public String getFieldsForInsert() {
             String fieldsForInsert = "(";
             boolean first = true;
-            Iterator it = aggregation.keySet().iterator();
+            Iterator<String> it = aggregation.keySet().iterator();
             
             while (it.hasNext()) {
                 if (first) {
@@ -376,6 +539,7 @@ public class NGSIMySQLSink extends NGSISink {
         @Override
         public void initialize(NGSIEvent cygnusEvent) throws CygnusBadConfiguration {
             super.initialize(cygnusEvent);
+            LinkedHashMap<String, ArrayList<String>> aggregation = getAggregation();
             aggregation.put(NGSIConstants.RECV_TIME_TS, new ArrayList<String>());
             aggregation.put(NGSIConstants.RECV_TIME, new ArrayList<String>());
             aggregation.put(NGSIConstants.FIWARE_SERVICE_PATH, new ArrayList<String>());
@@ -418,9 +582,10 @@ public class NGSIMySQLSink extends NGSISink {
                         + attrType + ")");
                 
                 // aggregate the attribute information
+                LinkedHashMap<String, ArrayList<String>> aggregation = getAggregation();
                 aggregation.get(NGSIConstants.RECV_TIME_TS).add(Long.toString(recvTimeTs));
                 aggregation.get(NGSIConstants.RECV_TIME).add(recvTime);
-                aggregation.get(NGSIConstants.FIWARE_SERVICE_PATH).add(servicePathForData);
+                aggregation.get(NGSIConstants.FIWARE_SERVICE_PATH).add(getServicePathForData());
                 aggregation.get(NGSIConstants.ENTITY_ID).add(entityId);
                 aggregation.get(NGSIConstants.ENTITY_TYPE).add(entityType);
                 aggregation.get(NGSIConstants.ATTR_NAME).add(attrName);
@@ -442,6 +607,7 @@ public class NGSIMySQLSink extends NGSISink {
             super.initialize(cygnusEvent);
             
             // particular initialization
+            LinkedHashMap<String, ArrayList<String>> aggregation = getAggregation();
             aggregation.put(NGSIConstants.RECV_TIME, new ArrayList<String>());
             aggregation.put(NGSIConstants.FIWARE_SERVICE_PATH, new ArrayList<String>());
             aggregation.put(NGSIConstants.ENTITY_ID, new ArrayList<String>());
@@ -464,7 +630,7 @@ public class NGSIMySQLSink extends NGSISink {
         @Override
         public void aggregate(NGSIEvent event) {
             // Number of previous values
-            int numPreviousValues = aggregation.get(NGSIConstants.FIWARE_SERVICE_PATH).size();
+            int numPreviousValues = getAggregation().get(NGSIConstants.FIWARE_SERVICE_PATH).size();
             
             // Get the event headers
             long recvTimeTs = event.getRecvTimeTs();
@@ -485,9 +651,10 @@ public class NGSIMySQLSink extends NGSISink {
                         + ", type=" + entityType + ")");
                 return;
             } // if
-            
+
+            LinkedHashMap<String, ArrayList<String>> aggregation = getAggregation();
             aggregation.get(NGSIConstants.RECV_TIME).add(recvTime);
-            aggregation.get(NGSIConstants.FIWARE_SERVICE_PATH).add(servicePathForData);
+            aggregation.get(NGSIConstants.FIWARE_SERVICE_PATH).add(getServicePathForData());
             aggregation.get(NGSIConstants.ENTITY_ID).add(entityId);
             aggregation.get(NGSIConstants.ENTITY_TYPE).add(entityType);
             
@@ -505,10 +672,10 @@ public class NGSIMySQLSink extends NGSISink {
                     aggregation.get(attrName).add(attrValue);
                     aggregation.get(attrName + "_md").add(attrMetadata);
                 } else {
-                    ArrayList values = new ArrayList<>(Collections.nCopies(numPreviousValues, ""));
+                    ArrayList<String> values = new ArrayList<>(Collections.nCopies(numPreviousValues, ""));
                     values.add(attrValue);
                     aggregation.put(attrName, values);
-                    ArrayList valuesMd = new ArrayList<>(Collections.nCopies(numPreviousValues, ""));
+                    ArrayList<String> valuesMd = new ArrayList<>(Collections.nCopies(numPreviousValues, ""));
                     valuesMd.add(attrMetadata);
                     aggregation.put(attrName + "_md", valuesMd);
                 } // if else
@@ -516,7 +683,7 @@ public class NGSIMySQLSink extends NGSISink {
             
             // Iterate on all the aggregations, checking for not updated attributes; add an empty value if missing
             for (String key : aggregation.keySet()) {
-                ArrayList values = aggregation.get(key);
+                ArrayList<String> values = aggregation.get(key);
                 
                 if (values.size() == numPreviousValues) {
                     values.add("");
@@ -542,7 +709,8 @@ public class NGSIMySQLSink extends NGSISink {
         String dbName = aggregator.getDbName(enableLowercase);
         String tableName = aggregator.getTableName(enableLowercase);
         
-        LOGGER.info("[" + this.getName() + "] Persisting data at NGSIMySQLSink. Database ("
+        LOGGER.info("[" + this.getName() + "] (" + Thread.currentThread().getId()
+                + ") Persisting data at NGSIMySQLSink. Database ("
                 + dbName + "), Table (" + tableName + "), Fields (" + fieldsForInsert + "), Values ("
                 + valuesForInsert + ")");
         
@@ -591,7 +759,7 @@ public class NGSIMySQLSink extends NGSISink {
         String name;
 
         if (enableEncoding) {
-            switch(dataModel) {
+            switch (dataModel) {
                 case DMBYSERVICEPATH:
                     name = NGSICharsets.encodeMySQL(servicePath);
                     break;
@@ -612,7 +780,7 @@ public class NGSIMySQLSink extends NGSISink {
                             + "'. Please, use dm-by-service-path, dm-by-entity or dm-by-attribute");
             } // switch
         } else {
-            switch(dataModel) {
+            switch (dataModel) {
                 case DMBYSERVICEPATH:
                     if (servicePath.equals("/")) {
                         throw new CygnusBadConfiguration("Default service path '/' cannot be used with "
@@ -645,5 +813,103 @@ public class NGSIMySQLSink extends NGSISink {
 
         return name;
     } // buildTableName
+    
+    /**
+     * This method makes two or more NGSIMySQLSinks to share the same connection pool.
+     * @param sourceSink
+     */
+    public void shareConnectionsFrom(NGSIMySQLSink sourceSink) {
+        LOGGER.debug("Linking " + this.getName() + " sink, to " + sourceSink.getName());
+        this.parentLoadBalanceSink = sourceSink;
+    } // shareConnectionsFrom
+    
+    /**
+     * Process override.
+     * @return
+     * @throws EventDeliveryException
+     */
+    @Override
+    public synchronized Status process() throws EventDeliveryException {
+        // Background or foreground process
+        try {
+            if (!processInBackground.get()) {
+                lastStatus = super.process();
+            } else {
+                processingSemaphore.acquire();
+                LOGGER.trace("Notify background process for sink " + this.getName());
+                notify(); // Run background thread
+                processingSemaphore.release();
+            }
+            return lastStatus;
+        } catch (InterruptedException e) {
+            LOGGER.error("Error triying to process sink " + this.getName());
+            return lastStatus;
+        }
+    } // process
 
+    /**
+     * Runs Process() in Background using a new Thread.
+     * The new thread will remain alive until stop() is called.
+     * @return true on success.
+     */
+    public boolean runBackgroundProcess() {
+        if (!processInBackground.get()) {
+            LOGGER.debug("Running process in background for sink " + this.getName());
+            // set finish flag to false
+            processInBackground.set(true);
+            backgroundThread = new Thread() {
+                public void run() {
+                    backgroundProcess();
+                }
+            };
+            backgroundThread.start();
+            return true;
+        } else {
+            LOGGER.error("Triying to start background process twice for sink " + this.getName());
+            return false;
+        }
+    } // runBackgroundProcess
+    
+    /**
+     * Process Method to be executed in background.
+     */
+    private synchronized void backgroundProcess() {
+        try {
+            LOGGER.debug("Starting Background process for sink " + this.getName()
+                    + ", thread: " + Thread.currentThread().getId());
+            
+            while (processInBackground.get()) {
+                LOGGER.trace("BackgroundProcess waiting semaphore.. " + this.getName());
+                processingSemaphore.acquire();
+                try {
+                    LOGGER.trace("Processing sink " + this.getName()
+                            + " in background, thread: " + Thread.currentThread().getId());
+                    lastStatus = super.process();
+                } catch (EventDeliveryException e) {
+                    LOGGER.error("Error processing Background sink: " + this.getName());
+                    lastStatus = Status.BACKOFF;
+                }
+                LOGGER.trace(Thread.currentThread().getId() + " Background Process waiting notifications.. "
+                        + this.getName());
+                processingSemaphore.release();
+                if (processInBackground.get()) {
+                    wait(); // Wait for the next execution notify
+                }
+                LOGGER.trace(Thread.currentThread().getId() + " Background Process Notification recived. "
+                        + this.getName());
+            }
+            
+            LOGGER.debug("Background process Finished for sink " + this.getName());
+            processInBackground.set(false);
+            backgroundThread = null;
+            
+        } catch (InterruptedException e) {
+            lastStatus = Status.BACKOFF;
+            processInBackground.set(false);
+            LOGGER.error("Error launching background process for sink " + this.getName());
+            backgroundThread = null;
+        }
+        
+    } // backgroundProcess
+    
 } // NGSIMySQLSink
